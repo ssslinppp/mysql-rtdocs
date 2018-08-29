@@ -176,6 +176,89 @@ Caused by: com.mysql.jdbc.exceptions.jdbc4.CommunicationsException: Communicatio
 
 ---
 
+## 常见问题
+#### 问题例一：
+MySQL8小时问题，Mysql服务器默认连接的“wait_timeout”是8小时，也就是说一个connection空闲超过8个小时，Mysql将自动断开该 connection。
+
+但是DBCP连接池并不知道连接已经断开了，如果程序正巧使用到这个已经断开的连接，程序就会报错误。
+
+#### 问题例二：
+以前还使用Sybase数据库，由于某种原因，数据库死了后重启、或断网后恢复。
+等了约10分钟后，DBCP连接池中的连接还都是不能使用的（断开的），访问数据应用一直
+报错，最后只能重启Tomcat问题才解决 。
+
+#### 解决方案：
+- 方案1、定时对连接做测试，测试失败就关闭连接。
+- 方案2、控制连接的空闲时间达到N分钟，就关闭连接，（然后可再新建连接）。
+
+以上两个方案使用任意一个就可以解决以述两类问题。如果只使用方案2，建议 N <= 5分钟。连接断开后最多5分钟后可恢复。
+
+也可混合使用两个方案，建议 N = 30分钟。
+
+下面就是DBCP连接池，同时使用了以上两个方案的配置配置
+- `validationQuery = "SELECT 1"`：验证连接是否可用，使用的SQL语句
+- `testWhileIdle = "true"`：指明连接是否被空闲连接回收器(如果有)进行检验.如果检测失败,则连接将被从池中去除.
+- `testOnBorrow = "false"`：借出连接时不要测试，否则很影响性能
+- `timeBetweenEvictionRunsMillis = "30000"`：每30秒运行一次空闲连接回收器
+- `minEvictableIdleTimeMillis = "1800000"`：  池中的连接空闲30分钟后被回收,默认值就是30分钟。
+- `numTestsPerEvictionRun="3"`： 在每次空闲连接回收器线程(如果有)运行时检查的连接数量，默认值就是3.
+
+#### 解释：
+配置`timeBetweenEvictionRunsMillis = "30000"`后，每30秒运行一次空闲连接回收器（独立线程）。并每次检查3个连接，如果连接空闲时间超过30分钟就销毁。销毁连接后，连接数量就少了，如果小于`minIdle`数量，就新建连接，维护数量不少于minIdle，过行了新老更替。
+
+`testWhileIdle = "true"` 表示每30秒，取出3条连接，使用validationQuery = "SELECT 1" 中的SQL进行测试 ，测试不成功就销毁连接。销毁连接后，连接数量就少了，如果小于minIdle数量，就新建连接。
+
+`testOnBorrow = "false"` 一定要配置，因为它的默认值是true。false表示每次从连接池中取出连接时，不需要执行validationQuery = "SELECT 1" 中的SQL进行测试。若配置为true,对性能有非常大的影响，性能会下降7-10倍。所在一定要配置为false.
+
+每30秒，取出numTestsPerEvictionRun条连接（本例是3，也是默认值），发出"SELECT 1" SQL语句进行测试 ，测试过的连接不算是“被使用”了，还算是空闲的。连接空闲30分钟后会被销毁。
+
+## DBCP连接池配置参数注意事项
+#### maxIdle值与maxActive值应配置的接近。
+因为，当连接数超过maxIdle值后，刚刚使用完的连接（刚刚空闲下来）会立即被销毁。而不是我想要的空闲M秒后再销毁起一个缓冲作用。这一点DBCP做的可能与你想像的不一样。
+
+若maxIdle与maxActive相差较大，在高负载的系统中会导致频繁的创建、销毁连接，连接数在maxIdle与maxActive间快速频繁波动，这不是我想要的。
+
+高负载系统的maxIdle值可以设置为与maxActive相同或设置为-1(-1表示不限制)，让连接数量在minIdle与maxIdle间缓冲慢速波动。
+
+#### timeBetweenEvictionRunsMillis建议设置值
+`initialSize="5"`，会在tomcat一启动时，创建5条连接，效果很理想。
+
+但同时我们还配置了`minIdle="10"`，也就是说，最少要保持10条连接，那现在只有5条连接，哪什么时候再创建少的5条连接呢？
+1、等业务压力上来了， DBCP就会创建新的连接。
+2、配置`timeBetweenEvictionRunsMillis=“时间”`,DBCP会启用独立的工作线程定时检查，补上少的5条连接。销毁多余的连接也是同理。
+
+
+## 连接销毁的逻辑
+DBCP的连接数会在:`0 - minIdle - maxIdle - maxActive`之间变化。变化的逻辑描述如下：
+
+默认未配置initialSize(默认值是0)和timeBetweenEvictionRunsMillis参数时，刚启动tomcat时，连接数是0。当应用有一个并发访问数据库时DBCP创建一个连接。
+
+目前连接数量还未达到minIdle，但DBCP也不自动创建新连接已使数量达到minIdle数量（没有一个独立的工作线程来检查和创建）。
+
+随着应用并发访问数据库的增多，连接数也增多，但都与minIdle值无关，很快minIdle被超越，minIdle值一点用都没有。
+
+直到连接的数量达到maxIdle值，这时的连接都是只增不减的。 再继续发展，连接数再增多并超过maxIdle时，使用完的连接（刚刚空闲下来的）会立即关闭，总体连接的数量稳定在maxIdle但不会超过maxIdle。
+
+但活动连接（在使用中的连接）可能数量上瞬间超过maxIdle，但永远不会超过maxActive。
+
+这时如果应用业务压力小了，访问数据库的并发少了，连接数也不会减少（没有一个独立的线程来检查和销毁），将保持在maxIdle的数量。
+
+默认未配置initialSize(默认值是0)，但配置了timeBetweenEvictionRunsMillis=“30000”（30秒）参数时，刚启动tomcat时，连接数是0。马上应用有一个并发访问数据库时DBCP创建一个连接。
+
+目前连接数量还未达到minIdle，每30秒DBCP的工作线程检查连接数是否少于minIdle数量，若少于就创建新连接直到达到minIdle数量。
+
+随着应用并发访问数据库的增多，连接数也增多，直到达到maxIdle值。这期间每30秒DBCP的工作线程检查连接是否空闲了30分钟，若是就销毁。但此时是业务的高峰期，是不会有长达30分钟的空闲连接的，工作线程查了也是白查，但它在工作。到这里连接数量一直是呈现增长的趋势。
+
+**当连接数再增多超过maxIdle时，使用完的连接(刚刚空闲下来)会立即关闭，总体连接的数量稳定在maxIdle**。停止了增长的趋势。但活动连接（在使用中的连接）可能数量上瞬间超过maxIdle，但永远不会超过maxActive。
+
+这时如果应用业务压力小了，访问数据库的并发少了，每30秒DBCP的工作线程检查连接(默认每次查3条)是否空闲达到30分钟(这是默认值)，**若连接空闲达到30分钟(minEvictableIdleTimeMillis )，就销毁连接。这时连接数减少了，呈下降趋势，将从maxIdle走向minIdle**。当小于minIdle值时，则DBCP创建新连接已使数量稳定在minIdle，并进行着新老更替。
+
+配置initialSize=“10”时，tomcat一启动就创建10条连接。其它同上。
+
+minIdle要与timeBetweenEvictionRunsMillis配合使用才有用,单独使用minIdle不会起作用。
+
+---
+
 ## 参考
 [DBCP连接池TestOnBorrow的坑](https://blog.csdn.net/wangyangzhizhou/article/details/52209336)      
 
@@ -184,6 +267,6 @@ Caused by: com.mysql.jdbc.exceptions.jdbc4.CommunicationsException: Communicatio
 [Apache Tomcat 8--The Tomcat JDBC Connection Pool](https://tomcat.apache.org/tomcat-8.0-doc/jdbc-pool.html)
 
 https://www.oschina.net/question/219875_2143124    
-http://soberchina.iteye.com/blog/2355289     
-
+http://soberchina.iteye.com/blog/2355289      
+http://elf8848.iteye.com/blog/1931778     
 
